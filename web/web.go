@@ -422,7 +422,13 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 
 	fileName := filepath.Base(filePath)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
-	w.Header().Set("Content-Type", "text/csv")
+	
+	// Set correct content type based on file extension
+	if strings.HasSuffix(filePath, ".json") {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", "text/csv")
+	}
 
 	_, err = io.Copy(w, file)
 	if err != nil {
@@ -461,7 +467,7 @@ type apiError struct {
 }
 
 type apiScrapeRequest struct {
-	Name string
+	Name    string `json:"name"`
 	JobData
 }
 

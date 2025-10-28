@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
+	"log"
 )
 
 type Image struct {
@@ -235,12 +238,15 @@ func (e *Entry) AddExtraReviews(pages [][]byte) {
 		return
 	}
 
+	initialCount := len(e.UserReviewsExtended)
 	for _, page := range pages {
 		reviews := extractReviews(page)
 		if len(reviews) > 0 {
 			e.UserReviewsExtended = append(e.UserReviewsExtended, reviews...)
 		}
 	}
+	log.Printf("AddExtraReviews for %s: added %d reviews from %d pages (total now: %d)", 
+		e.Title, len(e.UserReviewsExtended)-initialCount, len(pages), len(e.UserReviewsExtended))
 }
 
 func extractReviews(data []byte) []Review {
@@ -418,10 +424,111 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
 		5: int(getNthElementAndCast[float64](darray, 175, 3, 4)),
 	}
 
-	reviewsI := getNthElementAndCast[[]any](darray, 175, 9, 0, 0)
-	entry.UserReviews = make([]Review, 0, len(reviewsI))
+	// Parse the initial reviews from the main page data
+	// The CSV writer uses `user_reviews_extended`, so we populate that field
+	// Note: AddExtraReviews will append additional paginated reviews to this list later
+	entry.UserReviews = []Review{} // Keep user_reviews empty as per CSV output
+	entry.UserReviewsExtended = parseReviews(getNthElementAndCast[[]any](darray, 175, 9, 0, 0))
+	
+	log.Printf("Initial reviews parsed for %s: %d (more will be added via AddExtraReviews if available)", entry.Title, len(entry.UserReviewsExtended))
+
+	if reviewCountOnly != nil && len(reviewCountOnly) > 0 && reviewCountOnly[0] {
+		return entry, nil
+	}
 
 	return entry, nil
+}
+
+// FindRelativeDateString searches recursively through an array structure for a string containing "ago"
+// which indicates a relative date like "5 months ago"
+func FindRelativeDateString(arr []any) string {
+	for _, item := range arr {
+		switch v := item.(type) {
+		case string:
+			// Check if this string looks like a relative date
+			if strings.Contains(strings.ToLower(v), " ago") {
+				return v
+			}
+		case []any:
+			// Recursively search nested arrays
+			if result := FindRelativeDateString(v); result != "" {
+				return result
+			}
+		}
+	}
+	return ""
+}
+
+// ConvertRelativeDateToAbsolute converts relative date strings like "5 months ago" to absolute dates
+// It makes assumptions like assigning to the first of the month/week/year
+func ConvertRelativeDateToAbsolute(relativeDate string) string {
+	if relativeDate == "" {
+		return ""
+	}
+
+	now := time.Now()
+	relativeDate = strings.ToLower(strings.TrimSpace(relativeDate))
+
+	// Patterns to match relative dates
+	patterns := []struct {
+		regex *regexp.Regexp
+		unit  string
+	}{
+		{regexp.MustCompile(`(\d+)\s+year(?:s)?\s+ago`), "year"},
+		{regexp.MustCompile(`(\d+)\s+month(?:s)?\s+ago`), "month"},
+		{regexp.MustCompile(`(\d+)\s+week(?:s)?\s+ago`), "week"},
+		{regexp.MustCompile(`(\d+)\s+day(?:s)?\s+ago`), "day"},
+		{regexp.MustCompile(`(\d+)\s+hour(?:s)?\s+ago`), "hour"},
+		{regexp.MustCompile(`(\d+)\s+minutes(?:s)?\s+ago`), "minute"},
+		{regexp.MustCompile(`(\d+)\s+seconds(?:s)?\s+ago`), "second"},
+		{regexp.MustCompile(`a\s+year\s+ago`), "year"},
+		{regexp.MustCompile(`a\s+month\s+ago`), "month"},
+		{regexp.MustCompile(`a\s+week\s+ago`), "week"},
+		{regexp.MustCompile(`a\s+day\s+ago`), "day"},
+		{regexp.MustCompile(`an?\s+hour\s+ago`), "hour"},
+	}
+
+	for _, pattern := range patterns {
+		matches := pattern.regex.FindStringSubmatch(relativeDate)
+		if len(matches) > 0 {
+			amount := 1
+			if len(matches) > 1 {
+				amount, _ = strconv.Atoi(matches[1])
+			}
+
+			var targetDate time.Time
+			switch pattern.unit {
+			case "year":
+				// Go back N years, keeping the current month and day
+				targetDate = now.AddDate(-amount, 0, 0)
+			case "month":
+				// Go back N months, keeping the current day
+				targetDate = now.AddDate(0, -amount, 0)
+			case "week":
+				// Go back N weeks, keeping the current day of the week
+				targetDate = now.AddDate(0, 0, -amount*7)
+			case "day":
+				// Go back N days
+				targetDate = now.AddDate(0, 0, -amount)
+			case "hour":
+				// Go back N hours - use current date/time
+				targetDate = now.Add(time.Duration(-amount) * time.Hour)
+			case "minute":
+				// Go back N minutes - use current date/time
+				targetDate = now.Add(time.Duration(-amount) * time.Minute)
+			case "second":
+				// Go back N seconds - use current date/time
+				targetDate = now.Add(time.Duration(-amount) * time.Second)
+			default:
+				targetDate = now
+			}
+
+			return fmt.Sprintf("%d-%d-%d", targetDate.Year(), int(targetDate.Month()), targetDate.Day())
+		}
+	}
+
+	// If no pattern matched, return empty string
+	return ""
 }
 
 func parseReviews(reviewsI []any) []Review {
@@ -430,6 +537,7 @@ func parseReviews(reviewsI []any) []Review {
 	for i := range reviewsI {
 		el := getNthElementAndCast[[]any](reviewsI, i, 0)
 
+		// Try to get absolute date first (when photos are present)
 		time := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 6, 8)
 
 		profilePic, err := decodeURL(getNthElementAndCast[string](el, 1, 4, 5, 1))
@@ -437,18 +545,31 @@ func parseReviews(reviewsI []any) []Review {
 			profilePic = ""
 		}
 
+		// Determine the date string
+		var dateStr string
+		if len(time) >= 3 {
+			// Absolute date found
+			dateStr = fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
+		} else {
+			// Try to find relative date string (when photos are not present)
+			// Search recursively for any string containing "ago"
+			relativeDate := FindRelativeDateString(el)
+
+			// Convert relative date to absolute
+			if relativeDate != "" {
+				dateStr = ConvertRelativeDateToAbsolute(relativeDate)
+				if dateStr == "" {
+					continue // skip this review
+				}
+			} 
+		}
+
 		review := Review{
 			Name:           getNthElementAndCast[string](el, 1, 4, 5, 0),
 			ProfilePicture: profilePic,
-			When: func() string {
-				if len(time) < 3 {
-					return ""
-				}
-
-				return fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
-			}(),
-			Rating:      int(getNthElementAndCast[float64](el, 2, 0, 0)),
-			Description: getNthElementAndCast[string](el, 2, 15, 0, 0),
+			When:           dateStr,
+			Rating:         int(getNthElementAndCast[float64](el, 2, 0, 0)),
+			Description:    getNthElementAndCast[string](el, 2, 15, 0, 0),
 		}
 
 		if review.Name == "" {
@@ -599,6 +720,10 @@ func getNthElementAndCast[T any](arr []any, indexes ...int) T {
 	}
 
 	if len(indexes) == 0 || len(arr) == 0 {
+		return defaultVal
+	}
+
+	if indexes[0] >= len(arr) {
 		return defaultVal
 	}
 

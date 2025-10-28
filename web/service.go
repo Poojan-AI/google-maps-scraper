@@ -37,10 +37,19 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("invalid file name")
 	}
 
-	datapath := filepath.Join(s.dataFolder, id+".csv")
+	// Try to delete both CSV and JSON files (in case either exists)
+	csvPath := filepath.Join(s.dataFolder, id+".csv")
+	if _, err := os.Stat(csvPath); err == nil {
+		if err := os.Remove(csvPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 
-	if _, err := os.Stat(datapath); err == nil {
-		if err := os.Remove(datapath); err != nil {
+	jsonPath := filepath.Join(s.dataFolder, id+".json")
+	if _, err := os.Stat(jsonPath); err == nil {
+		if err := os.Remove(jsonPath); err != nil {
 			return err
 		}
 	} else if !os.IsNotExist(err) {
@@ -63,11 +72,16 @@ func (s *Service) GetCSV(_ context.Context, id string) (string, error) {
 		return "", fmt.Errorf("invalid file name")
 	}
 
-	datapath := filepath.Join(s.dataFolder, id+".csv")
-
-	if _, err := os.Stat(datapath); os.IsNotExist(err) {
-		return "", fmt.Errorf("csv file not found for job %s", id)
+	// Try JSON file first (used for extra reviews), then fall back to CSV
+	jsonPath := filepath.Join(s.dataFolder, id+".json")
+	if _, err := os.Stat(jsonPath); err == nil {
+		return jsonPath, nil
 	}
 
-	return datapath, nil
+	csvPath := filepath.Join(s.dataFolder, id+".csv")
+	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("result file not found for job %s", id)
+	}
+
+	return csvPath, nil
 }

@@ -3,6 +3,7 @@ package gmaps
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -67,6 +68,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 		resp.Meta = nil
 	}()
 
+	log.Printf("PlaceJob.Process: ExtractExtraReviews = %t", j.ExtractExtraReviews)
+
 	raw, ok := resp.Meta["json"].([]byte)
 	if !ok {
 		return nil, nil, fmt.Errorf("could not convert to []byte")
@@ -87,6 +90,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 	if ok && len(allReviewsRaw.pages) > 0 {
 		entry.AddExtraReviews(allReviewsRaw.pages)
 	}
+
+	log.Printf("PlaceJob.Process: Final entry for %s has %d reviews in UserReviewsExtended", entry.Title, len(entry.UserReviewsExtended))
 
 	if j.ExtractEmail && entry.IsWebsiteValidForEmail() {
 		opts := []EmailExtractJobOptions{}
@@ -157,8 +162,10 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page playwright.Page) scr
 
 	resp.Meta["json"] = raw
 
+	log.Printf("PlaceJob.BrowserActions: ExtractExtraReviews = %t", j.ExtractExtraReviews)
 	if j.ExtractExtraReviews {
 		reviewCount := j.getReviewCount(raw)
+		log.Printf("PlaceJob.BrowserActions: reviewCount = %d", reviewCount)
 		if reviewCount > 8 { // we have more reviews
 			params := fetchReviewsParams{
 				page:        page,

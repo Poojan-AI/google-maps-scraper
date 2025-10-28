@@ -20,6 +20,7 @@ import (
 	"github.com/gosom/google-maps-scraper/web/sqlite"
 	"github.com/gosom/scrapemate"
 	"github.com/gosom/scrapemate/adapters/writers/csvwriter"
+	"github.com/gosom/scrapemate/adapters/writers/jsonwriter"
 	"github.com/gosom/scrapemate/scrapemateapp"
 	"golang.org/x/sync/errgroup"
 )
@@ -144,7 +145,13 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		return w.svc.Update(ctx, job)
 	}
 
-	outpath := filepath.Join(w.cfg.DataFolder, job.ID+".csv")
+	// Use JSON format when extra reviews are enabled to handle large datasets better
+	var outpath string
+	if job.Data.ExtraReviews {
+		outpath = filepath.Join(w.cfg.DataFolder, job.ID+".json")
+	} else {
+		outpath = filepath.Join(w.cfg.DataFolder, job.ID+".csv")
+	}
 
 	outfile, err := os.Create(outpath)
 	if err != nil {
@@ -177,6 +184,8 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 	dedup := deduper.New()
 	exitMonitor := exiter.New()
 
+	log.Printf("Starting scrape for job %s. Global ExtraReviews: %t, Job ExtraReviews: %t", job.ID, w.cfg.ExtraReviews, job.Data.ExtraReviews)
+
 	seedJobs, err := runner.CreateSeedJobs(
 		job.Data.FastMode,
 		job.Data.Lang,
@@ -194,7 +203,7 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		}(),
 		dedup,
 		exitMonitor,
-		w.cfg.ExtraReviews,
+		job.Data.ExtraReviews,
 	)
 	if err != nil {
 		err2 := w.svc.Update(ctx, job)
@@ -286,9 +295,17 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
 
 	log.Printf("job %s has proxy: %v", job.ID, hasProxy)
 
-	csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(writer))
-
-	writers := []scrapemate.ResultWriter{csvWriter}
+	var writers []scrapemate.ResultWriter
+	if job.Data.ExtraReviews {
+		// Use JSON format for jobs with extra reviews to handle large datasets
+		jsonWriter := jsonwriter.NewJSONWriter(writer)
+		writers = []scrapemate.ResultWriter{jsonWriter}
+		log.Printf("job %s using JSON writer for extra reviews", job.ID)
+	} else {
+		csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(writer))
+		writers = []scrapemate.ResultWriter{csvWriter}
+		log.Printf("job %s using CSV writer", job.ID)
+	}
 
 	matecfg, err := scrapemateapp.NewConfig(
 		writers,

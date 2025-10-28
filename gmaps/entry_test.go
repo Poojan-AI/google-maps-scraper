@@ -216,3 +216,169 @@ func Test_EntryFromJsonC(t *testing.T) {
 		fmt.Printf("%+v\n", entry)
 	}
 }
+
+func Test_ConvertRelativeDateToAbsolute(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantYear int
+	}{
+		{
+			name:     "5 months ago",
+			input:    "5 months ago",
+			wantYear: -1, // Will be determined at runtime
+		},
+		{
+			name:     "a month ago",
+			input:    "a month ago",
+			wantYear: -1,
+		},
+		{
+			name:     "2 years ago",
+			input:    "2 years ago",
+			wantYear: -1,
+		},
+		{
+			name:     "a year ago",
+			input:    "a year ago",
+			wantYear: -1,
+		},
+		{
+			name:     "3 weeks ago",
+			input:    "3 weeks ago",
+			wantYear: -1,
+		},
+		{
+			name:     "a week ago",
+			input:    "a week ago",
+			wantYear: -1,
+		},
+		{
+			name:     "10 days ago",
+			input:    "10 days ago",
+			wantYear: -1,
+		},
+		{
+			name:     "a day ago",
+			input:    "a day ago",
+			wantYear: -1,
+		},
+		{
+			name:     "5 hours ago",
+			input:    "5 hours ago",
+			wantYear: -1,
+		},
+		{
+			name:     "an hour ago",
+			input:    "an hour ago",
+			wantYear: -1,
+		},
+		{
+			name:     "1 hour ago",
+			input:    "1 hour ago",
+			wantYear: -1,
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			wantYear: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := gmaps.ConvertRelativeDateToAbsolute(tt.input)
+
+			if tt.input == "" {
+				require.Empty(t, result)
+				return
+			}
+
+			// Verify result is not empty for valid input
+			require.NotEmpty(t, result, "Expected non-empty result for input: %s", tt.input)
+
+			// Verify result is in the format YYYY-M-D or YYYY-MM-DD
+			require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+		})
+	}
+}
+
+func Test_ConvertRelativeDateToAbsolute_MonthsAgo(t *testing.T) {
+	result := gmaps.ConvertRelativeDateToAbsolute("5 months ago")
+	require.NotEmpty(t, result)
+
+	// The result should be 5 months ago from now, keeping the same day
+	// We can't test exact date, but we can verify format
+	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+}
+
+func Test_ConvertRelativeDateToAbsolute_YearsAgo(t *testing.T) {
+	result := gmaps.ConvertRelativeDateToAbsolute("2 years ago")
+	require.NotEmpty(t, result)
+
+	// The result should be 2 years ago from now, keeping the same month and day
+	// We can't test exact date, but we can verify format
+	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+}
+
+func Test_ConvertRelativeDateToAbsolute_HoursAgo(t *testing.T) {
+	// Test with current day - hours ago should return today's date
+	result := gmaps.ConvertRelativeDateToAbsolute("5 hours ago")
+	require.NotEmpty(t, result)
+
+	// Should return a valid date format
+	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+
+	// Test "an hour ago"
+	result = gmaps.ConvertRelativeDateToAbsolute("an hour ago")
+	require.NotEmpty(t, result)
+	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+
+	// Test "1 hour ago"
+	result = gmaps.ConvertRelativeDateToAbsolute("1 hour ago")
+	require.NotEmpty(t, result)
+	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
+}
+
+func Test_FindRelativeDateString(t *testing.T) {
+	// Test with simple array
+	simpleArray := []any{
+		"some string",
+		"5 months ago",
+		"another string",
+	}
+	result := gmaps.FindRelativeDateString(simpleArray)
+	require.Equal(t, "5 months ago", result)
+
+	// Test with nested array
+	nestedArray := []any{
+		"some string",
+		123,
+		[]any{
+			"nested string",
+			[]any{
+				"deeply nested",
+				"2 years ago",
+			},
+		},
+		"after",
+	}
+	result = gmaps.FindRelativeDateString(nestedArray)
+	require.Equal(t, "2 years ago", result)
+
+	// Test with no relative date
+	noDateArray := []any{
+		"some string",
+		"no date here",
+		[]any{"nested", "values"},
+	}
+	result = gmaps.FindRelativeDateString(noDateArray)
+	require.Empty(t, result)
+
+	// Test with "AGO" in uppercase (case insensitive check)
+	uppercaseArray := []any{
+		"3 WEEKS AGO",
+	}
+	result = gmaps.FindRelativeDateString(uppercaseArray)
+	require.Equal(t, "3 WEEKS AGO", result)
+}

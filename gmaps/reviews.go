@@ -110,7 +110,7 @@ func (f *fetcher) generateURL(mapURL, pageToken string, pageSize int, requestID 
 	}
 
 	fullURL := fmt.Sprintf(
-		"https://www.google.com/maps/rpc/listugcposts?authuser=0&hl=el&pb=%s",
+		"https://www.google.com/maps/rpc/listugcposts?authuser=0&hl=en&pb=%s",
 		strings.Join(pbComponents, ""),
 	)
 
