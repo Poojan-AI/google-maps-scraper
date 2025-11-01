@@ -1,7 +1,7 @@
 # Build stage for Playwright dependencies
 FROM ubuntu:20.04 AS playwright-deps
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
-#ENV PLAYWRIGHT_DRIVER_PATH=/opt/
+ENV PLAYWRIGHT_DRIVER_PATH=/opt
 RUN export PATH=$PATH:/usr/local/go/bin:/root/go/bin \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl wget \
@@ -13,7 +13,7 @@ RUN export PATH=$PATH:/usr/local/go/bin:/root/go/bin \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && go install github.com/playwright-community/playwright-go/cmd/playwright@latest \
-    && mkdir -p /opt/browsers \
+    && mkdir -p /opt/browsers /opt \
     && playwright install chromium --with-deps
 
 # Build stage
@@ -32,6 +32,7 @@ ENV PLAYWRIGHT_DRIVER_PATH=/opt
 # Install only the necessary dependencies in a single layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -51,14 +52,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=playwright-deps /opt/browsers /opt/browsers
-COPY --from=playwright-deps /root/.cache/ms-playwright-go /opt/ms-playwright-go
+COPY --from=playwright-deps /opt /opt
+COPY --from=playwright-deps /root/go/bin/playwright /usr/local/bin/playwright
 
-RUN chmod -R 755 /opt/browsers \
-    && chmod -R 755 /opt/ms-playwright-go
+RUN chmod -R 755 /opt \
+    && chmod +x /usr/local/bin/playwright
 
 COPY --from=builder /usr/bin/google-maps-scraper /usr/bin/
 

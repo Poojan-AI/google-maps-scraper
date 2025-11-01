@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosom/google-maps-scraper/deduper"
@@ -25,10 +26,17 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	// MaxConcurrentJobs defines the maximum number of jobs that can be processed concurrently
+	// Can be overridden by setting a lower Concurrency value in runner.Config
+	MaxConcurrentJobs = 5
+)
+
 type webrunner struct {
-	srv *web.Server
-	svc *web.Service
-	cfg *runner.Config
+	srv        *web.Server
+	svc        *web.Service
+	cfg        *runner.Config
+	jobSemaphore chan struct{} // Semaphore to limit concurrent jobs
 }
 
 func New(cfg *runner.Config) (runner.Runner, error) {
@@ -56,10 +64,23 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 		return nil, err
 	}
 
+	// Determine the number of concurrent jobs to allow
+	// Use MaxConcurrentJobs by default, but allow cfg.Concurrency to override if explicitly set higher
+	maxJobs := MaxConcurrentJobs
+	if cfg.Concurrency > MaxConcurrentJobs {
+		// If user explicitly sets a higher concurrency, respect it
+		maxJobs = cfg.Concurrency
+	}
+	// Note: We always use MaxConcurrentJobs (5) for multi-job concurrency in web mode
+	// The cfg.Concurrency controls per-job place scraping concurrency, not multi-job concurrency
+	
+	log.Printf("Webrunner initialized with max %d concurrent jobs (cfg.Concurrency=%d)", maxJobs, cfg.Concurrency)
+
 	ans := webrunner{
-		srv: srv,
-		svc: svc,
-		cfg: cfg,
+		srv:          srv,
+		svc:          svc,
+		cfg:          cfg,
+		jobSemaphore: make(chan struct{}, maxJobs),
 	}
 
 	return &ans, nil
@@ -87,9 +108,14 @@ func (w *webrunner) work(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	// WaitGroup to track running jobs
+	var wg sync.WaitGroup
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Wait for all running jobs to complete before exiting
+			wg.Wait()
 			return nil
 		case <-ticker.C:
 			jobs, err := w.svc.SelectPending(ctx)
@@ -97,34 +123,51 @@ func (w *webrunner) work(ctx context.Context) error {
 				return err
 			}
 
+			// Launch jobs concurrently, respecting the semaphore limit
 			for i := range jobs {
 				select {
 				case <-ctx.Done():
+					// Wait for all running jobs to complete before exiting
+					wg.Wait()
 					return nil
 				default:
-					t0 := time.Now().UTC()
-					if err := w.scrapeJob(ctx, &jobs[i]); err != nil {
-						params := map[string]any{
-							"job_count": len(jobs[i].Data.Keywords),
-							"duration":  time.Now().UTC().Sub(t0).String(),
-							"error":     err.Error(),
+					// Acquire semaphore slot (blocks if at capacity)
+					w.jobSemaphore <- struct{}{}
+					
+					wg.Add(1)
+					
+					// Launch goroutine to process job
+					go func(job *web.Job) {
+						defer wg.Done()
+						defer func() {
+							// Release semaphore slot
+							<-w.jobSemaphore
+						}()
+
+						t0 := time.Now().UTC()
+						if err := w.scrapeJob(ctx, job); err != nil {
+							params := map[string]any{
+								"job_count": len(job.Data.Keywords),
+								"duration":  time.Now().UTC().Sub(t0).String(),
+								"error":     err.Error(),
+							}
+
+							evt := tlmt.NewEvent("web_runner", params)
+
+							_ = runner.Telemetry().Send(ctx, evt)
+
+							log.Printf("error scraping job %s: %v", job.ID, err)
+						} else {
+							params := map[string]any{
+								"job_count": len(job.Data.Keywords),
+								"duration":  time.Now().UTC().Sub(t0).String(),
+							}
+
+							_ = runner.Telemetry().Send(ctx, tlmt.NewEvent("web_runner", params))
+
+							log.Printf("job %s scraped successfully", job.ID)
 						}
-
-						evt := tlmt.NewEvent("web_runner", params)
-
-						_ = runner.Telemetry().Send(ctx, evt)
-
-						log.Printf("error scraping job %s: %v", jobs[i].ID, err)
-					} else {
-						params := map[string]any{
-							"job_count": len(jobs[i].Data.Keywords),
-							"duration":  time.Now().UTC().Sub(t0).String(),
-						}
-
-						_ = runner.Telemetry().Send(ctx, tlmt.NewEvent("web_runner", params))
-
-						log.Printf("job %s scraped successfully", jobs[i].ID)
-					}
+					}(&jobs[i])
 				}
 			}
 		}
@@ -279,11 +322,13 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
 	if len(w.cfg.Proxies) > 0 {
 		opts = append(opts, scrapemateapp.WithProxies(w.cfg.Proxies))
 		hasProxy = true
+		log.Printf("job %s using global proxy config: %v", job.ID, w.cfg.Proxies)
 	} else if len(job.Data.Proxies) > 0 {
 		opts = append(opts,
 			scrapemateapp.WithProxies(job.Data.Proxies),
 		)
 		hasProxy = true
+		log.Printf("job %s using job-specific proxy: %v", job.ID, job.Data.Proxies)
 	}
 
 	if !w.cfg.DisablePageReuse {
@@ -293,7 +338,9 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
 		)
 	}
 
-	log.Printf("job %s has proxy: %v", job.ID, hasProxy)
+	if !hasProxy {
+		log.Printf("job %s running WITHOUT proxy", job.ID)
+	}
 
 	var writers []scrapemate.ResultWriter
 	if job.Data.ExtraReviews {
