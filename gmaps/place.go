@@ -24,6 +24,10 @@ type PlaceJob struct {
 	ExtractEmail        bool
 	ExitMonitor         exiter.Exiter
 	ExtractExtraReviews bool
+	
+	// Proxy rotation support
+	ProxyList        []string // List of proxy URLs to rotate through
+	CurrentProxyIdx  int      // Current proxy index for retry attempts
 }
 
 func NewPlaceJob(parentID, langCode, u string, extractEmail, extraExtraReviews bool, opts ...PlaceJobOptions) *PlaceJob {
@@ -58,6 +62,13 @@ func NewPlaceJob(parentID, langCode, u string, extractEmail, extraExtraReviews b
 func WithPlaceJobExitMonitor(exitMonitor exiter.Exiter) PlaceJobOptions {
 	return func(j *PlaceJob) {
 		j.ExitMonitor = exitMonitor
+	}
+}
+
+func WithPlaceJobProxies(proxies []string) PlaceJobOptions {
+	return func(j *PlaceJob) {
+		j.ProxyList = proxies
+		j.CurrentProxyIdx = 0
 	}
 }
 

@@ -205,20 +205,60 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		_ = outfile.Close()
 	}()
 
-	mate, err := w.setupMate(ctx, outfile, job)
-	if err != nil {
-		job.Status = web.StatusFailed
-
-		err2 := w.svc.Update(ctx, job)
-		if err2 != nil {
-			log.Printf("failed to update job status: %v", err2)
-		}
-
-		return err
+	// Proxy rotation: try each proxy in sequence if job fails
+	var lastErr error
+	maxProxyRetries := 1 // Default: no proxy rotation
+	
+	if len(job.Data.Proxies) > 1 {
+		maxProxyRetries = len(job.Data.Proxies)
+		log.Printf("Job %s has %d proxies available for rotation on failure", job.ID, maxProxyRetries)
 	}
+	
+	for proxyIdx := 0; proxyIdx < maxProxyRetries; proxyIdx++ {
+		if proxyIdx > 0 {
+			log.Printf("Job %s: Retrying with proxy #%d after previous failure", job.ID, proxyIdx+1)
+			// Truncate and reopen the output file for retry
+			outfile.Close()
+			outfile, err = os.Create(outpath)
+			if err != nil {
+				return err
+			}
+		}
+		
+		mate, err := w.setupMateWithProxyIndex(ctx, outfile, job, proxyIdx)
+		if err != nil {
+			lastErr = err
+			log.Printf("Job %s: Failed to setup scraper with proxy #%d: %v", job.ID, proxyIdx+1, err)
+			if mate != nil {
+				mate.Close()
+			}
+			continue
+		}
+		
+		// Try to run the job with this proxy
+		lastErr = w.executeJobWithMate(ctx, job, mate, proxyIdx, maxProxyRetries)
+		mate.Close()
+		
+		if lastErr == nil {
+			// Success! No need to try more proxies
+			log.Printf("Job %s: Completed successfully with proxy #%d", job.ID, proxyIdx+1)
+			job.Status = web.StatusOK
+			return w.svc.Update(ctx, job)
+		}
+		
+		log.Printf("Job %s: Failed with proxy #%d: %v", job.ID, proxyIdx+1, lastErr)
+	}
+	
+	// All proxies failed
+	job.Status = web.StatusFailed
+	err2 := w.svc.Update(ctx, job)
+	if err2 != nil {
+		log.Printf("failed to update job status: %v", err2)
+	}
+	return fmt.Errorf("job failed with all %d proxies, last error: %w", maxProxyRetries, lastErr)
+}
 
-	defer mate.Close()
-
+func (w *webrunner) executeJobWithMate(ctx context.Context, job *web.Job, mate *scrapemateapp.ScrapemateApp, proxyIdx int, totalProxies int) error {
 	var coords string
 	if job.Data.Lat != "" && job.Data.Lon != "" {
 		coords = job.Data.Lat + "," + job.Data.Lon
@@ -249,11 +289,6 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		job.Data.ExtraReviews,
 	)
 	if err != nil {
-		err2 := w.svc.Update(ctx, job)
-		if err2 != nil {
-			log.Printf("failed to update job status: %v", err2)
-		}
-
 		return err
 	}
 
@@ -269,6 +304,14 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 				allowedSeconds = int(job.Data.MaxTime.Seconds())
 			}
 		}
+		
+		// For proxy rotation: use full timeout for each proxy attempt
+		// Progress monitoring will detect failures quickly (25 seconds with no progress)
+		// So we don't need to artificially reduce timeout
+		if totalProxies > 1 {
+			log.Printf("Proxy rotation enabled (attempt %d/%d): using full %d seconds timeout with progress monitoring", 
+				proxyIdx+1, totalProxies, allowedSeconds)
+		}
 
 		log.Printf("running job %s with %d seed jobs and %d allowed seconds", job.ID, len(seedJobs), allowedSeconds)
 
@@ -279,29 +322,74 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 		go exitMonitor.Run(mateCtx)
 
-		err = mate.Start(mateCtx, seedJobs...)
+		// Start scraping with early failure detection
+		errChan := make(chan error, 1)
+		go func() {
+			errChan <- mate.Start(mateCtx, seedJobs...)
+		}()
+		
+		// Monitor progress for early failure detection (especially for proxy issues)
+		progressTicker := time.NewTicker(25 * time.Second) // Check every 25 seconds
+		defer progressTicker.Stop()
+		
+		var lastPlacesCompleted int
+		progressCheckCount := 0
+		
+	monitorLoop:
+		for {
+			select {
+			case err = <-errChan:
+				// Scraping finished (success or error)
+				break monitorLoop
+				
+			case <-progressTicker.C:
+				// Check if we're making progress
+				currentPlacesCompleted := exitMonitor.GetPlacesCompleted()
+				progressCheckCount++
+				
+				if currentPlacesCompleted == 0 && progressCheckCount >= 1 {
+					// No results after 25 seconds (1 check) - likely proxy/connection issue
+					cancel()
+					log.Printf("Job %s: No progress after %d seconds, likely proxy failure", job.ID, progressCheckCount*25)
+					return fmt.Errorf("no scraping progress after %d seconds - proxy may be blocked or connection failed", progressCheckCount*25)
+				}
+				
+				if currentPlacesCompleted > lastPlacesCompleted {	
+					// We're making progress, keep going
+					log.Printf("Job %s: Progress check - %d places completed", job.ID, currentPlacesCompleted)
+					lastPlacesCompleted = currentPlacesCompleted
+				}
+				
+			case <-mateCtx.Done():
+				// Timeout reached
+				break monitorLoop
+			}
+		}
+		
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			cancel()
-
-			err2 := w.svc.Update(ctx, job)
-			if err2 != nil {
-				log.Printf("failed to update job status: %v", err2)
-			}
-
 			return err
 		}
 
 		cancel()
+		
+		// Check if we actually got any results
+		placesCompleted := exitMonitor.GetPlacesCompleted()
+		log.Printf("Job %s completed with %d places scraped", job.ID, placesCompleted)
+		
+		if placesCompleted == 0 {
+			return fmt.Errorf("no places were successfully scraped (0 results)")
+		}
 	}
 
-	mate.Close()
-
-	job.Status = web.StatusOK
-
-	return w.svc.Update(ctx, job)
+	return nil
 }
 
 func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job) (*scrapemateapp.ScrapemateApp, error) {
+	return w.setupMateWithProxyIndex(nil, writer, job, 0)
+}
+
+func (w *webrunner) setupMateWithProxyIndex(_ context.Context, writer io.Writer, job *web.Job, proxyIndex int) (*scrapemateapp.ScrapemateApp, error) {
 	opts := []func(*scrapemateapp.Config) error{
 		scrapemateapp.WithConcurrency(w.cfg.Concurrency),
 		scrapemateapp.WithExitOnInactivity(time.Minute * 3),
@@ -324,11 +412,20 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
 		hasProxy = true
 		log.Printf("job %s using global proxy config: %v", job.ID, w.cfg.Proxies)
 	} else if len(job.Data.Proxies) > 0 {
+		// Use specific proxy from the list based on proxyIndex
+		var proxyToUse []string
+		if proxyIndex < len(job.Data.Proxies) {
+			proxyToUse = []string{job.Data.Proxies[proxyIndex]}
+		} else {
+			// Fallback to first proxy if index is out of bounds
+			proxyToUse = []string{job.Data.Proxies[0]}
+		}
+		
 		opts = append(opts,
-			scrapemateapp.WithProxies(job.Data.Proxies),
+			scrapemateapp.WithProxies(proxyToUse),
 		)
 		hasProxy = true
-		log.Printf("job %s using job-specific proxy: %v", job.ID, job.Data.Proxies)
+		log.Printf("job %s using proxy #%d: %s", job.ID, proxyIndex+1, proxyToUse[0])
 	}
 
 	if !w.cfg.DisablePageReuse {
