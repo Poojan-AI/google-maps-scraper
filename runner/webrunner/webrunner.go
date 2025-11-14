@@ -306,7 +306,7 @@ func (w *webrunner) executeJobWithMate(ctx context.Context, job *web.Job, mate *
 		}
 		
 		// For proxy rotation: use full timeout for each proxy attempt
-		// Progress monitoring will detect failures quickly (25 seconds with no progress)
+		// Progress monitoring will detect failures quickly (30 seconds with no progress)
 		// So we don't need to artificially reduce timeout
 		if totalProxies > 1 {
 			log.Printf("Proxy rotation enabled (attempt %d/%d): using full %d seconds timeout with progress monitoring", 
@@ -329,10 +329,12 @@ func (w *webrunner) executeJobWithMate(ctx context.Context, job *web.Job, mate *
 		}()
 		
 		// Monitor progress for early failure detection (especially for proxy issues)
-		progressTicker := time.NewTicker(25 * time.Second) // Check every 25 seconds
+		progressTicker := time.NewTicker(30 * time.Second) // Check every 30 seconds
 		defer progressTicker.Stop()
 		
 		var lastPlacesCompleted int
+		var lastPlacesFound int
+		var lastSeedCompleted int
 		progressCheckCount := 0
 		
 	monitorLoop:
@@ -343,21 +345,30 @@ func (w *webrunner) executeJobWithMate(ctx context.Context, job *web.Job, mate *
 				break monitorLoop
 				
 			case <-progressTicker.C:
-				// Check if we're making progress
+				// Check if we're making ANY progress (found, completed, or seed processing)
 				currentPlacesCompleted := exitMonitor.GetPlacesCompleted()
+				currentPlacesFound := exitMonitor.GetPlacesFound()
+				currentSeedCompleted := exitMonitor.GetSeedCompleted()
 				progressCheckCount++
 				
-				if currentPlacesCompleted == 0 && progressCheckCount >= 1 {
-					// No results after 25 seconds (1 check) - likely proxy/connection issue
+				// Check if there's ANY activity at all
+				hasAnyActivity := currentPlacesFound > 0 || currentPlacesCompleted > 0 || currentSeedCompleted > 0
+				
+				if !hasAnyActivity && progressCheckCount >= 1 {
+					// No activity after 30 seconds (1 check) - likely proxy/connection issue
 					cancel()
-					log.Printf("Job %s: No progress after %d seconds, likely proxy failure", job.ID, progressCheckCount*25)
-					return fmt.Errorf("no scraping progress after %d seconds - proxy may be blocked or connection failed", progressCheckCount*25)
+					log.Printf("Job %s: No activity after %d seconds (found=%d, completed=%d, seeds=%d), likely proxy failure", 
+						job.ID, progressCheckCount*30, currentPlacesFound, currentPlacesCompleted, currentSeedCompleted)
+					return fmt.Errorf("no scraping activity after %d seconds - proxy may be blocked or connection failed", progressCheckCount*30)
 				}
 				
-				if currentPlacesCompleted > lastPlacesCompleted {	
-					// We're making progress, keep going
-					log.Printf("Job %s: Progress check - %d places completed", job.ID, currentPlacesCompleted)
+				// Log progress if we see any changes
+				if currentPlacesCompleted > lastPlacesCompleted || currentPlacesFound > lastPlacesFound || currentSeedCompleted > lastSeedCompleted {
+					log.Printf("Job %s: Progress check - seeds: %d, found: %d, completed: %d", 
+						job.ID, currentSeedCompleted, currentPlacesFound, currentPlacesCompleted)
 					lastPlacesCompleted = currentPlacesCompleted
+					lastPlacesFound = currentPlacesFound
+					lastSeedCompleted = currentSeedCompleted
 				}
 				
 			case <-mateCtx.Done():
