@@ -28,8 +28,20 @@ import (
 
 const (
 	// MaxConcurrentJobs defines the maximum number of jobs that can be processed concurrently
-	// Can be overridden by setting a lower Concurrency value in runner.Config
-	MaxConcurrentJobs = 5
+	// 
+	// Constraints considered:
+	// 1. Proxy pool: 23 usable proxies (25 total - 2 excluded bad ones)
+	// 2. Detection avoidance: Don't use all proxies simultaneously (looks suspicious)
+	// 3. Memory: Each job with Playwright uses ~200-300MB RAM
+	// 4. CPU: Each job spawns browser instances (CPU intensive)
+	// 
+	// Recommended values:
+	// - Conservative (2GB RAM): 5 jobs  (~1.5GB peak usage)
+	// - Moderate (4GB RAM):     10 jobs (~3GB peak usage)
+	// - Aggressive (8GB+ RAM):  15 jobs (~4.5GB peak usage)
+	// 
+	// Current setting optimized for: Moderate workload with good detection avoidance
+	MaxConcurrentJobs = 10
 )
 
 type webrunner struct {
