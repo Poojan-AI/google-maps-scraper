@@ -1,0 +1,613 @@
+diff --git a/gmaps/entry.go b/gmaps/entry.go
+index f929baa..75c7f14 100644
+--- a/gmaps/entry.go
++++ b/gmaps/entry.go
+@@ -5,10 +5,13 @@ import (
+ 	"fmt"
+ 	"iter"
+ 	"math"
++	"regexp"
+ 	"runtime/debug"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
++	"time"
++	"log"
+ )
+ 
+ type Image struct {
+@@ -235,12 +238,15 @@ func (e *Entry) AddExtraReviews(pages [][]byte) {
+ 		return
+ 	}
+ 
++	initialCount := len(e.UserReviewsExtended)
+ 	for _, page := range pages {
+ 		reviews := extractReviews(page)
+ 		if len(reviews) > 0 {
+ 			e.UserReviewsExtended = append(e.UserReviewsExtended, reviews...)
+ 		}
+ 	}
++	log.Printf("AddExtraReviews for %s: added %d reviews from %d pages (total now: %d)", 
++		e.Title, len(e.UserReviewsExtended)-initialCount, len(pages), len(e.UserReviewsExtended))
+ }
+ 
+ func extractReviews(data []byte) []Review {
+@@ -418,18 +424,120 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
+ 		5: int(getNthElementAndCast[float64](darray, 175, 3, 4)),
+ 	}
+ 
+-	reviewsI := getNthElementAndCast[[]any](darray, 175, 9, 0, 0)
+-	entry.UserReviews = make([]Review, 0, len(reviewsI))
++	// Parse the initial reviews from the main page data
++	// The CSV writer uses `user_reviews_extended`, so we populate that field
++	// Note: AddExtraReviews will append additional paginated reviews to this list later
++	entry.UserReviews = []Review{} // Keep user_reviews empty as per CSV output
++	entry.UserReviewsExtended = parseReviews(getNthElementAndCast[[]any](darray, 175, 9, 0, 0))
++	
++	log.Printf("Initial reviews parsed for %s: %d (more will be added via AddExtraReviews if available)", entry.Title, len(entry.UserReviewsExtended))
++
++	if reviewCountOnly != nil && len(reviewCountOnly) > 0 && reviewCountOnly[0] {
++		return entry, nil
++	}
+ 
+ 	return entry, nil
+ }
+ 
++// FindRelativeDateString searches recursively through an array structure for a string containing "ago"
++// which indicates a relative date like "5 months ago"
++func FindRelativeDateString(arr []any) string {
++	for _, item := range arr {
++		switch v := item.(type) {
++		case string:
++			// Check if this string looks like a relative date
++			if strings.Contains(strings.ToLower(v), " ago") {
++				return v
++			}
++		case []any:
++			// Recursively search nested arrays
++			if result := FindRelativeDateString(v); result != "" {
++				return result
++			}
++		}
++	}
++	return ""
++}
++
++// ConvertRelativeDateToAbsolute converts relative date strings like "5 months ago" to absolute dates
++// It makes assumptions like assigning to the first of the month/week/year
++func ConvertRelativeDateToAbsolute(relativeDate string) string {
++	if relativeDate == "" {
++		return ""
++	}
++
++	now := time.Now()
++	relativeDate = strings.ToLower(strings.TrimSpace(relativeDate))
++
++	// Patterns to match relative dates
++	patterns := []struct {
++		regex *regexp.Regexp
++		unit  string
++	}{
++		{regexp.MustCompile(`(\d+)\s+year(?:s)?\s+ago`), "year"},
++		{regexp.MustCompile(`(\d+)\s+month(?:s)?\s+ago`), "month"},
++		{regexp.MustCompile(`(\d+)\s+week(?:s)?\s+ago`), "week"},
++		{regexp.MustCompile(`(\d+)\s+day(?:s)?\s+ago`), "day"},
++		{regexp.MustCompile(`(\d+)\s+hour(?:s)?\s+ago`), "hour"},
++		{regexp.MustCompile(`(\d+)\s+minutes(?:s)?\s+ago`), "minute"},
++		{regexp.MustCompile(`(\d+)\s+seconds(?:s)?\s+ago`), "second"},
++		{regexp.MustCompile(`a\s+year\s+ago`), "year"},
++		{regexp.MustCompile(`a\s+month\s+ago`), "month"},
++		{regexp.MustCompile(`a\s+week\s+ago`), "week"},
++		{regexp.MustCompile(`a\s+day\s+ago`), "day"},
++		{regexp.MustCompile(`an?\s+hour\s+ago`), "hour"},
++	}
++
++	for _, pattern := range patterns {
++		matches := pattern.regex.FindStringSubmatch(relativeDate)
++		if len(matches) > 0 {
++			amount := 1
++			if len(matches) > 1 {
++				amount, _ = strconv.Atoi(matches[1])
++			}
++
++			var targetDate time.Time
++			switch pattern.unit {
++			case "year":
++				// Go back N years, keeping the current month and day
++				targetDate = now.AddDate(-amount, 0, 0)
++			case "month":
++				// Go back N months, keeping the current day
++				targetDate = now.AddDate(0, -amount, 0)
++			case "week":
++				// Go back N weeks, keeping the current day of the week
++				targetDate = now.AddDate(0, 0, -amount*7)
++			case "day":
++				// Go back N days
++				targetDate = now.AddDate(0, 0, -amount)
++			case "hour":
++				// Go back N hours - use current date/time
++				targetDate = now.Add(time.Duration(-amount) * time.Hour)
++			case "minute":
++				// Go back N minutes - use current date/time
++				targetDate = now.Add(time.Duration(-amount) * time.Minute)
++			case "second":
++				// Go back N seconds - use current date/time
++				targetDate = now.Add(time.Duration(-amount) * time.Second)
++			default:
++				targetDate = now
++			}
++
++			return fmt.Sprintf("%d-%d-%d", targetDate.Year(), int(targetDate.Month()), targetDate.Day())
++		}
++	}
++
++	// If no pattern matched, return empty string
++	return ""
++}
++
+ func parseReviews(reviewsI []any) []Review {
+ 	ans := make([]Review, 0, len(reviewsI))
+ 
+ 	for i := range reviewsI {
+ 		el := getNthElementAndCast[[]any](reviewsI, i, 0)
+ 
++		// Try to get absolute date first (when photos are present)
+ 		time := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 6, 8)
+ 
+ 		profilePic, err := decodeURL(getNthElementAndCast[string](el, 1, 4, 5, 1))
+@@ -437,18 +545,31 @@ func parseReviews(reviewsI []any) []Review {
+ 			profilePic = ""
+ 		}
+ 
++		// Determine the date string
++		var dateStr string
++		if len(time) >= 3 {
++			// Absolute date found
++			dateStr = fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
++		} else {
++			// Try to find relative date string (when photos are not present)
++			// Search recursively for any string containing "ago"
++			relativeDate := FindRelativeDateString(el)
++
++			// Convert relative date to absolute
++			if relativeDate != "" {
++				dateStr = ConvertRelativeDateToAbsolute(relativeDate)
++				if dateStr == "" {
++					continue // skip this review
++				}
++			} 
++		}
++
+ 		review := Review{
+ 			Name:           getNthElementAndCast[string](el, 1, 4, 5, 0),
+ 			ProfilePicture: profilePic,
+-			When: func() string {
+-				if len(time) < 3 {
+-					return ""
+-				}
+-
+-				return fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
+-			}(),
+-			Rating:      int(getNthElementAndCast[float64](el, 2, 0, 0)),
+-			Description: getNthElementAndCast[string](el, 2, 15, 0, 0),
++			When:           dateStr,
++			Rating:         int(getNthElementAndCast[float64](el, 2, 0, 0)),
++			Description:    getNthElementAndCast[string](el, 2, 15, 0, 0),
+ 		}
+ 
+ 		if review.Name == "" {
+@@ -602,6 +723,10 @@ func getNthElementAndCast[T any](arr []any, indexes ...int) T {
+ 		return defaultVal
+ 	}
+ 
++	if indexes[0] >= len(arr) {
++		return defaultVal
++	}
++
+ 	ans, ok := arr[indexes[0]].(T)
+ 	if !ok {
+ 		return defaultVal
+diff --git a/gmaps/entry_test.go b/gmaps/entry_test.go
+index 6c20a9b..0b45f78 100644
+--- a/gmaps/entry_test.go
++++ b/gmaps/entry_test.go
+@@ -216,3 +216,169 @@ func Test_EntryFromJsonC(t *testing.T) {
+ 		fmt.Printf("%+v\n", entry)
+ 	}
+ }
++
++func Test_ConvertRelativeDateToAbsolute(t *testing.T) {
++	tests := []struct {
++		name     string
++		input    string
++		wantYear int
++	}{
++		{
++			name:     "5 months ago",
++			input:    "5 months ago",
++			wantYear: -1, // Will be determined at runtime
++		},
++		{
++			name:     "a month ago",
++			input:    "a month ago",
++			wantYear: -1,
++		},
++		{
++			name:     "2 years ago",
++			input:    "2 years ago",
++			wantYear: -1,
++		},
++		{
++			name:     "a year ago",
++			input:    "a year ago",
++			wantYear: -1,
++		},
++		{
++			name:     "3 weeks ago",
++			input:    "3 weeks ago",
++			wantYear: -1,
++		},
++		{
++			name:     "a week ago",
++			input:    "a week ago",
++			wantYear: -1,
++		},
++		{
++			name:     "10 days ago",
++			input:    "10 days ago",
++			wantYear: -1,
++		},
++		{
++			name:     "a day ago",
++			input:    "a day ago",
++			wantYear: -1,
++		},
++		{
++			name:     "5 hours ago",
++			input:    "5 hours ago",
++			wantYear: -1,
++		},
++		{
++			name:     "an hour ago",
++			input:    "an hour ago",
++			wantYear: -1,
++		},
++		{
++			name:     "1 hour ago",
++			input:    "1 hour ago",
++			wantYear: -1,
++		},
++		{
++			name:     "empty string",
++			input:    "",
++			wantYear: 0,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := gmaps.ConvertRelativeDateToAbsolute(tt.input)
++
++			if tt.input == "" {
++				require.Empty(t, result)
++				return
++			}
++
++			// Verify result is not empty for valid input
++			require.NotEmpty(t, result, "Expected non-empty result for input: %s", tt.input)
++
++			// Verify result is in the format YYYY-M-D or YYYY-MM-DD
++			require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++		})
++	}
++}
++
++func Test_ConvertRelativeDateToAbsolute_MonthsAgo(t *testing.T) {
++	result := gmaps.ConvertRelativeDateToAbsolute("5 months ago")
++	require.NotEmpty(t, result)
++
++	// The result should be 5 months ago from now, keeping the same day
++	// We can't test exact date, but we can verify format
++	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++}
++
++func Test_ConvertRelativeDateToAbsolute_YearsAgo(t *testing.T) {
++	result := gmaps.ConvertRelativeDateToAbsolute("2 years ago")
++	require.NotEmpty(t, result)
++
++	// The result should be 2 years ago from now, keeping the same month and day
++	// We can't test exact date, but we can verify format
++	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++}
++
++func Test_ConvertRelativeDateToAbsolute_HoursAgo(t *testing.T) {
++	// Test with current day - hours ago should return today's date
++	result := gmaps.ConvertRelativeDateToAbsolute("5 hours ago")
++	require.NotEmpty(t, result)
++
++	// Should return a valid date format
++	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++
++	// Test "an hour ago"
++	result = gmaps.ConvertRelativeDateToAbsolute("an hour ago")
++	require.NotEmpty(t, result)
++	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++
++	// Test "1 hour ago"
++	result = gmaps.ConvertRelativeDateToAbsolute("1 hour ago")
++	require.NotEmpty(t, result)
++	require.Regexp(t, `^\d{4}-\d{1,2}-\d{1,2}$`, result)
++}
++
++func Test_FindRelativeDateString(t *testing.T) {
++	// Test with simple array
++	simpleArray := []any{
++		"some string",
++		"5 months ago",
++		"another string",
++	}
++	result := gmaps.FindRelativeDateString(simpleArray)
++	require.Equal(t, "5 months ago", result)
++
++	// Test with nested array
++	nestedArray := []any{
++		"some string",
++		123,
++		[]any{
++			"nested string",
++			[]any{
++				"deeply nested",
++				"2 years ago",
++			},
++		},
++		"after",
++	}
++	result = gmaps.FindRelativeDateString(nestedArray)
++	require.Equal(t, "2 years ago", result)
++
++	// Test with no relative date
++	noDateArray := []any{
++		"some string",
++		"no date here",
++		[]any{"nested", "values"},
++	}
++	result = gmaps.FindRelativeDateString(noDateArray)
++	require.Empty(t, result)
++
++	// Test with "AGO" in uppercase (case insensitive check)
++	uppercaseArray := []any{
++		"3 WEEKS AGO",
++	}
++	result = gmaps.FindRelativeDateString(uppercaseArray)
++	require.Equal(t, "3 WEEKS AGO", result)
++}
+diff --git a/gmaps/place.go b/gmaps/place.go
+index 2741644..9f6a720 100644
+--- a/gmaps/place.go
++++ b/gmaps/place.go
+@@ -3,6 +3,7 @@ package gmaps
+ import (
+ 	"context"
+ 	"fmt"
++	"log"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -67,6 +68,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+ 		resp.Meta = nil
+ 	}()
+ 
++	log.Printf("PlaceJob.Process: ExtractExtraReviews = %t", j.ExtractExtraReviews)
++
+ 	raw, ok := resp.Meta["json"].([]byte)
+ 	if !ok {
+ 		return nil, nil, fmt.Errorf("could not convert to []byte")
+@@ -88,6 +91,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+ 		entry.AddExtraReviews(allReviewsRaw.pages)
+ 	}
+ 
++	log.Printf("PlaceJob.Process: Final entry for %s has %d reviews in UserReviewsExtended", entry.Title, len(entry.UserReviewsExtended))
++
+ 	if j.ExtractEmail && entry.IsWebsiteValidForEmail() {
+ 		opts := []EmailExtractJobOptions{}
+ 		if j.ExitMonitor != nil {
+@@ -157,8 +162,10 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page playwright.Page) scr
+ 
+ 	resp.Meta["json"] = raw
+ 
++	log.Printf("PlaceJob.BrowserActions: ExtractExtraReviews = %t", j.ExtractExtraReviews)
+ 	if j.ExtractExtraReviews {
+ 		reviewCount := j.getReviewCount(raw)
++		log.Printf("PlaceJob.BrowserActions: reviewCount = %d", reviewCount)
+ 		if reviewCount > 8 { // we have more reviews
+ 			params := fetchReviewsParams{
+ 				page:        page,
+diff --git a/gmaps/reviews.go b/gmaps/reviews.go
+index 63fa95f..df348a9 100644
+--- a/gmaps/reviews.go
++++ b/gmaps/reviews.go
+@@ -110,7 +110,7 @@ func (f *fetcher) generateURL(mapURL, pageToken string, pageSize int, requestID
+ 	}
+ 
+ 	fullURL := fmt.Sprintf(
+-		"https://www.google.com/maps/rpc/listugcposts?authuser=0&hl=el&pb=%s",
++		"https://www.google.com/maps/rpc/listugcposts?authuser=0&hl=en&pb=%s",
+ 		strings.Join(pbComponents, ""),
+ 	)
+ 
+diff --git a/runner/webrunner/webrunner.go b/runner/webrunner/webrunner.go
+index 61484f0..a5f905a 100644
+--- a/runner/webrunner/webrunner.go
++++ b/runner/webrunner/webrunner.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/gosom/google-maps-scraper/web/sqlite"
+ 	"github.com/gosom/scrapemate"
+ 	"github.com/gosom/scrapemate/adapters/writers/csvwriter"
++	"github.com/gosom/scrapemate/adapters/writers/jsonwriter"
+ 	"github.com/gosom/scrapemate/scrapemateapp"
+ 	"golang.org/x/sync/errgroup"
+ )
+@@ -144,7 +145,13 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+ 		return w.svc.Update(ctx, job)
+ 	}
+ 
+-	outpath := filepath.Join(w.cfg.DataFolder, job.ID+".csv")
++	// Use JSON format when extra reviews are enabled to handle large datasets better
++	var outpath string
++	if job.Data.ExtraReviews {
++		outpath = filepath.Join(w.cfg.DataFolder, job.ID+".json")
++	} else {
++		outpath = filepath.Join(w.cfg.DataFolder, job.ID+".csv")
++	}
+ 
+ 	outfile, err := os.Create(outpath)
+ 	if err != nil {
+@@ -177,6 +184,8 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+ 	dedup := deduper.New()
+ 	exitMonitor := exiter.New()
+ 
++	log.Printf("Starting scrape for job %s. Global ExtraReviews: %t, Job ExtraReviews: %t", job.ID, w.cfg.ExtraReviews, job.Data.ExtraReviews)
++
+ 	seedJobs, err := runner.CreateSeedJobs(
+ 		job.Data.FastMode,
+ 		job.Data.Lang,
+@@ -194,7 +203,7 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+ 		}(),
+ 		dedup,
+ 		exitMonitor,
+-		w.cfg.ExtraReviews,
++		job.Data.ExtraReviews,
+ 	)
+ 	if err != nil {
+ 		err2 := w.svc.Update(ctx, job)
+@@ -286,9 +295,17 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
+ 
+ 	log.Printf("job %s has proxy: %v", job.ID, hasProxy)
+ 
+-	csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(writer))
+-
+-	writers := []scrapemate.ResultWriter{csvWriter}
++	var writers []scrapemate.ResultWriter
++	if job.Data.ExtraReviews {
++		// Use JSON format for jobs with extra reviews to handle large datasets
++		jsonWriter := jsonwriter.NewJSONWriter(writer)
++		writers = []scrapemate.ResultWriter{jsonWriter}
++		log.Printf("job %s using JSON writer for extra reviews", job.ID)
++	} else {
++		csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(writer))
++		writers = []scrapemate.ResultWriter{csvWriter}
++		log.Printf("job %s using CSV writer", job.ID)
++	}
+ 
+ 	matecfg, err := scrapemateapp.NewConfig(
+ 		writers,
+diff --git a/web/job.go b/web/job.go
+index 6b5924b..0505ff4 100644
+--- a/web/job.go
++++ b/web/job.go
+@@ -61,17 +61,18 @@ func (j *Job) Validate() error {
+ }
+ 
+ type JobData struct {
+-	Keywords []string      `json:"keywords"`
+-	Lang     string        `json:"lang"`
+-	Zoom     int           `json:"zoom"`
+-	Lat      string        `json:"lat"`
+-	Lon      string        `json:"lon"`
+-	FastMode bool          `json:"fast_mode"`
+-	Radius   int           `json:"radius"`
+-	Depth    int           `json:"depth"`
+-	Email    bool          `json:"email"`
+-	MaxTime  time.Duration `json:"max_time"`
+-	Proxies  []string      `json:"proxies"`
++	Keywords     []string      `json:"keywords"`
++	Lang         string        `json:"lang"`
++	Zoom         int           `json:"zoom"`
++	Lat          string        `json:"lat"`
++	Lon          string        `json:"lon"`
++	FastMode     bool          `json:"fast_mode"`
++	Radius       int           `json:"radius"`
++	Depth        int           `json:"depth"`
++	Email        bool          `json:"email"`
++	ExtraReviews bool          `json:"extra_reviews"`
++	MaxTime      time.Duration `json:"max_time"`
++	Proxies      []string      `json:"proxies"`
+ }
+ 
+ func (d *JobData) Validate() error {
+diff --git a/web/service.go b/web/service.go
+index 2dbc3c0..99c5c91 100644
+--- a/web/service.go
++++ b/web/service.go
+@@ -37,10 +37,19 @@ func (s *Service) Delete(ctx context.Context, id string) error {
+ 		return fmt.Errorf("invalid file name")
+ 	}
+ 
+-	datapath := filepath.Join(s.dataFolder, id+".csv")
++	// Try to delete both CSV and JSON files (in case either exists)
++	csvPath := filepath.Join(s.dataFolder, id+".csv")
++	if _, err := os.Stat(csvPath); err == nil {
++		if err := os.Remove(csvPath); err != nil {
++			return err
++		}
++	} else if !os.IsNotExist(err) {
++		return err
++	}
+ 
+-	if _, err := os.Stat(datapath); err == nil {
+-		if err := os.Remove(datapath); err != nil {
++	jsonPath := filepath.Join(s.dataFolder, id+".json")
++	if _, err := os.Stat(jsonPath); err == nil {
++		if err := os.Remove(jsonPath); err != nil {
+ 			return err
+ 		}
+ 	} else if !os.IsNotExist(err) {
+@@ -63,11 +72,16 @@ func (s *Service) GetCSV(_ context.Context, id string) (string, error) {
+ 		return "", fmt.Errorf("invalid file name")
+ 	}
+ 
+-	datapath := filepath.Join(s.dataFolder, id+".csv")
++	// Try JSON file first (used for extra reviews), then fall back to CSV
++	jsonPath := filepath.Join(s.dataFolder, id+".json")
++	if _, err := os.Stat(jsonPath); err == nil {
++		return jsonPath, nil
++	}
+ 
+-	if _, err := os.Stat(datapath); os.IsNotExist(err) {
+-		return "", fmt.Errorf("csv file not found for job %s", id)
++	csvPath := filepath.Join(s.dataFolder, id+".csv")
++	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
++		return "", fmt.Errorf("result file not found for job %s", id)
+ 	}
+ 
+-	return datapath, nil
++	return csvPath, nil
+ }
+diff --git a/web/web.go b/web/web.go
+index 932cc89..5fc9114 100644
+--- a/web/web.go
++++ b/web/web.go
+@@ -422,7 +422,13 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+ 
+ 	fileName := filepath.Base(filePath)
+ 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+-	w.Header().Set("Content-Type", "text/csv")
++	
++	// Set correct content type based on file extension
++	if strings.HasSuffix(filePath, ".json") {
++		w.Header().Set("Content-Type", "application/json")
++	} else {
++		w.Header().Set("Content-Type", "text/csv")
++	}
+ 
+ 	_, err = io.Copy(w, file)
+ 	if err != nil {
+@@ -461,7 +467,7 @@ type apiError struct {
+ }
+ 
+ type apiScrapeRequest struct {
+-	Name string
++	Name    string `json:"name"`
+ 	JobData
+ }
+ 
